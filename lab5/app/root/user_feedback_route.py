@@ -1,7 +1,7 @@
 from http import HTTPStatus
 from flask import Blueprint, jsonify, request, make_response
 from ..controller.user_feedback_controller import UserFeedbackController
-from app import db
+from ...app import db
 from ..domain.user_feedback import UserFeedback
 from ..domain.users import User
 

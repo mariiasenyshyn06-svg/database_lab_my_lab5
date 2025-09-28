@@ -1,8 +1,8 @@
 import mysql.connector
 from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
-from app.config import Config
-from app.root import register_routes
+from .config import Config
+from .root import register_routes
 import os
 import sys
 

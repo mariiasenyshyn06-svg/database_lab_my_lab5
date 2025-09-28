@@ -1,6 +1,6 @@
 from flask import Blueprint, request, jsonify, make_response, current_app
-from app import db
-from app.domain import ProgramsHasExercise
+from ...app import db
+from ..domain import ProgramsHasExercise
 from http import HTTPStatus
 
 programs_has_exercise_bp = Blueprint('programs_has_exercise', __name__, url_prefix='/programs_has_exercise')

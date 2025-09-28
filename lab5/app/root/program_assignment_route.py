@@ -2,7 +2,7 @@ from http import HTTPStatus
 from flask import Blueprint, jsonify, Response, request, make_response
 from ..controller import program_assignment_controller
 from ..domain.program_assignment import ProgramAssignment
-from app import db
+from ...app import db
 from ..domain.programs import Program
 
 program_assignment_bp = Blueprint('program_assignment', __name__, url_prefix='/program-assignment')

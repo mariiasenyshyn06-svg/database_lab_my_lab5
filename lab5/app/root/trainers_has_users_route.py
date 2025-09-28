@@ -5,7 +5,7 @@ from ..domain.trainers_has_users import TrainersHasUsers
 from ..domain.trainers import Trainer
 from ..domain.users import User
 from datetime import datetime
-from app import db
+from ...app import db
 
 trainers_has_users_bp = Blueprint('trainers-has-users', __name__, url_prefix='/trainers-has-users')
 
