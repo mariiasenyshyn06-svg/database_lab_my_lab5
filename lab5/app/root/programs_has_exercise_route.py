@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify, make_response, current_app
-from ...app import db
+from app import db
 from ..domain import ProgramsHasExercise
 from http import HTTPStatus
 

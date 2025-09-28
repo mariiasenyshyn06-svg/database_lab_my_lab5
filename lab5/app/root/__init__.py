@@ -1,7 +1,7 @@
 # app/routes.py
 
 from flask import Flask
-from app.root.error_handler import err_handler_bp
+from .error_handler import err_handler_bp
 
 def register_routes(app: Flask) -> None:
     # Реєструємо обробники помилок
