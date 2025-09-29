@@ -24,9 +24,10 @@ def create_app():
 def create_database():
     try:
         connection = mysql.connector.connect(
-            host='127.0.0.1',
-            user='root',
-            password='Yulia2006.'
+            host='gym-database.caxii84umkba.us-east-1.rds.amazonaws.com',
+            user='gym_user',
+            password='Yulia2006.',
+            database='gym_2'
         )
         cursor = connection.cursor()
         cursor.execute("CREATE DATABASE IF NOT EXISTS gym_2")
