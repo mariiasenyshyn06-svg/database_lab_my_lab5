@@ -1,30 +1,57 @@
+import mysql.connector
 from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
 from .config import Config
 from .root import register_routes
 import os
+import sys
 
+print(sys.path)
 db = SQLAlchemy()
+
 
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
     db.init_app(app)
     register_routes(app)
+    create_database()
     create_tables(app)
     populate_data()
     return app
+
+
+def create_database():
+    try:
+        connection = mysql.connector.connect(
+            host='gym-database.caxii84umkba.us-east-1.rds.amazonaws.com',  # RDS хост
+            user='gym_user',
+            password='Yulia2006.',
+            database='gym_2'
+        )
+        cursor = connection.cursor()
+        cursor.execute("CREATE DATABASE IF NOT EXISTS gym_2")
+        print("Database created successfully or already exists.")
+        cursor.close()
+    except mysql.connector.Error as error:
+        print(f"Error creating database: {error}")
+    finally:
+        if 'connection' in locals() and connection.is_connected():
+            connection.close()
+
+
+
 
 def create_tables(app):
     with app.app_context():
         db.create_all()
 
+
 def populate_data():
     sql_file_path = os.path.abspath('data.sql')
     if os.path.exists(sql_file_path):
-        import mysql.connector
         connection = mysql.connector.connect(
-            host='gym-database.caxii84umkba.us-east-1.rds.amazonaws.com',
+            host='gym-database.caxii84umkba.us-east-1.rds.amazonaws.com',  # RDS хост
             user='gym_user',
             password='Yulia2006.',
             database='gym_2'
@@ -44,3 +71,4 @@ def populate_data():
                         connection.rollback()
         cursor.close()
         connection.close()
+
