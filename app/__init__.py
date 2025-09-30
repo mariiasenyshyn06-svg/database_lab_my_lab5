@@ -5,16 +5,11 @@ from .config import Config
 from .root import register_routes
 import os
 import sys
-from .root.docs_route import docs_bp
-from .root.swagger_route import swagger_bp, swagger_ui_bp
+
 
 print(sys.path)
 db = SQLAlchemy()
 
-def register_routes(app):
-    app.register_blueprint(docs_bp, url_prefix="")
-    app.register_blueprint(swagger_bp, url_prefix="")
-    app.register_blueprint(swagger_ui_bp, url_prefix="/swagger")
 
 def create_app():
     app = Flask(__name__)

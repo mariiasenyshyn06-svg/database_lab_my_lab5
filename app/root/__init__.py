@@ -20,7 +20,12 @@ def register_routes(app: Flask) -> None:
     from .trainers_has_users_route import trainers_has_users_bp
     from .user_feedback_route import user_feedback_bp
 
-    # Реєструємо маршрутизатори
+    from .docs_route import docs_bp
+    from .swagger_route import swagger_bp, swagger_ui_bp
+    app.register_blueprint(docs_bp)
+    app.register_blueprint(swagger_bp)
+    app.register_blueprint(swagger_ui_bp)
+
     app.register_blueprint(user_bp)
     app.register_blueprint(trainer_bp)
     app.register_blueprint(program_bp)

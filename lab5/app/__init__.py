@@ -20,7 +20,6 @@ def create_app():
     populate_data()
     return app
 
-
 def create_database():
     try:
         connection = mysql.connector.connect(
