@@ -1,0 +1,46 @@
+name: Deploy-Lab5-to-EC2
+
+on:
+  push:
+    branches:
+      - lab-5  
+
+jobs:
+  deploy:
+    name: Deploy Flask Lab5 project to EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Sync project files to EC2
+        uses: easingthemes/ssh-deploy@main
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+          REMOTE_HOST: ${{ secrets.HOST_DNS }}
+          REMOTE_USER: ${{ secrets.USERNAME }}
+          TARGET: ${{ secrets.TARGET_DIR }}
+
+      - name: Restart Flask Lab5 service on EC2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_DNS }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ec2-user/database_lab_my_lab5     
+            if [ ! -d "venv" ]; then
+              python3 -m venv venv
+            fi
+            source venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements.txt
+            sudo systemctl restart lab5app              
+            sleep 5
+            sudo systemctl status lab5app --no-pager
+
+      - name: Healthcheck API
+        run: |
+          echo "Checking if Lab5 Flask API is alive..."
+          curl -f http://${{ secrets.HOST_DNS }}:5000/program || exit 1
