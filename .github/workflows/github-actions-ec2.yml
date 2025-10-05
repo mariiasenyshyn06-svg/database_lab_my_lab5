@@ -43,4 +43,4 @@ jobs:
       - name: Healthcheck API
         run: |
           echo "Checking if Lab5 Flask API is alive..."
-          curl -f http://${{ secrets.HOST_DNS }}:5000/api/books || exit 1
+          curl -f http://${{ secrets.HOST_DNS }}:5000/books || exit 1
