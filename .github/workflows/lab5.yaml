@@ -193,7 +193,26 @@ jobs:
 
           echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
           echo "Swagger URL:  http://$ALB_DNS$HEALTH_PATH"
+          echo "==> Autoscaling 1..2 on 60% CPU"
+          aws application-autoscaling register-scalable-target \
+            --service-namespace ecs \
+            --resource-id service/$CLUSTER_NAME/$SERVICE_NAME \
+            --scalable-dimension ecs:service:DesiredCount \
+            --min-capacity 1 \
+            --max-capacity 2 >/dev/null || true
 
+          aws application-autoscaling put-scaling-policy \
+            --service-namespace ecs \
+            --resource-id service/$CLUSTER_NAME/$SERVICE_NAME \
+            --scalable-dimension ecs:service:DesiredCount \
+            --policy-name cpu60 \
+            --policy-type TargetTrackingScaling \
+            --target-tracking-scaling-policy-configuration '{
+              "TargetValue": 60.0,
+              "PredefinedMetricSpecification": { "PredefinedMetricType": "ECSServiceAverageCPUUtilization" },
+              "ScaleInCooldown": 60,
+              "ScaleOutCooldown": 60
+            }' >/dev/null || true
       - name: Wait service stable
         run: |
           aws ecs wait services-stable --cluster "$CLUSTER_NAME" --services "$SERVICE_NAME"
