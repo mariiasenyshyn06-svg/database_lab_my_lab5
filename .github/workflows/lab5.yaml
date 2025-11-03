@@ -5,7 +5,14 @@ on:
     branches: ["lab-5"]
 
 env:
-  AWS_REGION: eu-north-1
+  AWS_REGION: us-east-1
+  RDS_ID: gym-database
+  DB_HOST: gym-database.caxii84umkba.us-east-1.rds.amazonaws.com
+  DB_NAME: gym_2
+  DB_USER: gym_user
+  DB_PASS: "Yulia2006."  
+  DATABASE_URL: "mysql+pymysql://gym_user:Yulia2006.@gym-database.caxii84umkba.us-east-1.rds.amazonaws.com:3306/gym_2"
+
   ECR_REPOSITORY: lab5b-api              
   CLUSTER_NAME: lab5b-cluster            
   SERVICE_NAME: lab5b-svc
@@ -17,8 +24,6 @@ env:
   TG_NAME: lab5b-tg
   ALB_SG_NAME: lab5b-alb-sg
   ECS_SG_NAME: lab5b-ecs-sg
-
-  DATABASE_URL: "mysql+mysqlconnector://admin:NewStrongPass!123@database-lab-1.c3u0c6k0idq9.eu-north-1.rds.amazonaws.com:3306/gym_2"
 
   HEALTH_PATH: "/swagger"
 
