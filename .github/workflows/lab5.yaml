@@ -337,3 +337,4 @@ jobs:
             --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}" >/dev/null
 
           echo "Started loadgen against: $TARGET_URL"
+
