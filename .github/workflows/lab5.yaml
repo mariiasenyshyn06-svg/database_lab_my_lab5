@@ -176,9 +176,20 @@ jobs:
           fi
 
           echo "==> (optional) розв'язуємо доступ ECS -> RDS"
-          # відкриваємо 3306 з ECS_SG у SG RDS-інстансу (разово; якщо вже відкрито — проскочить)
-          RDS_SG=$(aws rds describe-db-instances --db-instance-identifier database-lab-1 --query 'DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId' --output text)
-          aws ec2 authorize-security-group-ingress --group-id "$RDS_SG" --protocol tcp --port 3306 --source-group "$ECS_SG_ID" >/dev/null 2>&1 || true
+          if aws rds describe-db-instances --region "$AWS_REGION" --db-instance-identifier "$RDS_ID" >/dev/null 2>&1; then
+            RDS_SG=$(aws rds describe-db-instances \
+                        --region "$AWS_REGION" \
+                        --db-instance-identifier "$RDS_ID" \
+                        --query 'DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId' \
+                        --output text)
+            aws ec2 authorize-security-group-ingress \
+                --group-id "$RDS_SG" \
+                --protocol tcp --port 3306 \
+                --source-group "$ECS_SG_ID" >/dev/null 2>&1 || true
+            echo "Linked ECS SG $ECS_SG_ID -> RDS SG $RDS_SG:3306"
+          else
+            echo "RDS '$RDS_ID' not found in $AWS_REGION — skipping SG link."
+          fi
 
           echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
           echo "Swagger URL:  http://$ALB_DNS$HEALTH_PATH"
