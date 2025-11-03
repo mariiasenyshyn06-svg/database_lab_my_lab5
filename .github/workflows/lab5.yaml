@@ -1,0 +1,304 @@
+name: Lab5 (app + infra + autoscale + loadgen)
+
+on:
+  push:
+    branches: ["lab-5"]
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: lab5b-api              
+  CLUSTER_NAME: lab5b-cluster            
+  SERVICE_NAME: lab5b-svc
+  FAMILY: lab5b-task
+  CONTAINER_NAME: lab5b-api
+  CONTAINER_PORT: "8000"
+
+  ALB_NAME: lab5b-alb
+  TG_NAME: lab5b-tg
+  ALB_SG_NAME: lab5b-alb-sg
+  ECS_SG_NAME: lab5b-ecs-sg
+
+  DATABASE_URL: "mysql+mysqlconnector://admin:NewStrongPass!123@database-lab-1.c3u0c6k0idq9.eu-north-1.rds.amazonaws.com:3306/gym_2"
+
+  HEALTH_PATH: "/swagger"
+
+  DOCKERFILE: "Dockerfile"     
+  BUILD_CONTEXT: "."         
+
+  LOADGEN_REPO: lab5b-loadgen
+  LOADGEN_CONCURRENCY: "200"
+  LOADGEN_DURATION: "600"
+
+jobs:
+  all-in-one:
+    runs-on: ubuntu-latest
+    outputs:
+      alb_dns: ${{ steps.provision.outputs.alb_dns }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure ECR exists
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "$ECR_REPOSITORY" >/dev/null
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push app image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -f "$DOCKERFILE" -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG "$BUILD_CONTEXT"
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "IMAGE=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Provision infra + deploy + autoscaling
+        id: provision
+        shell: bash
+        run: |
+          set -e
+
+          echo "==> Default VPC"
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+          echo "VPC_ID=$VPC_ID"
+
+          echo "==> Two public subnets"
+          SUBNETS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC_ID --query 'Subnets[?MapPublicIpOnLaunch==`true`].SubnetId' --output text)
+          SUBNET1=$(echo $SUBNETS | awk '{print $1}'); SUBNET2=$(echo $SUBNETS | awk '{print $2}')
+          if [ -z "$SUBNET1" ] || [ -z "$SUBNET2" ]; then echo "Need >=2 public subnets in default VPC"; exit 1; fi
+
+          echo "==> SGs"
+          ALB_SG_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values=$ALB_SG_NAME Name=vpc-id,Values=$VPC_ID --query 'SecurityGroups[0].GroupId' --output text)
+          [ "$ALB_SG_ID" = "None" ] || [ -z "$ALB_SG_ID" ] && ALB_SG_ID=$(aws ec2 create-security-group --group-name $ALB_SG_NAME --description "ALB SG" --vpc-id $VPC_ID --query 'GroupId' --output text)
+          aws ec2 authorize-security-group-ingress --group-id $ALB_SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
+
+          ECS_SG_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values=$ECS_SG_NAME Name=vpc-id,Values=$VPC_ID --query 'SecurityGroups[0].GroupId' --output text)
+          [ "$ECS_SG_ID" = "None" ] || [ -z "$ECS_SG_ID" ] && ECS_SG_ID=$(aws ec2 create-security-group --group-name $ECS_SG_NAME --description "ECS SG" --vpc-id $VPC_ID --query 'GroupId' --output text)
+          aws ec2 authorize-security-group-ingress --group-id $ECS_SG_ID --protocol tcp --port $CONTAINER_PORT --source-group $ALB_SG_ID >/dev/null 2>&1 || true
+
+          echo "==> Target Group"
+          set +e
+          TG_ARN=$(aws elbv2 create-target-group --name $TG_NAME --protocol HTTP --port $CONTAINER_PORT --target-type ip --vpc-id $VPC_ID --health-check-path $HEALTH_PATH --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null)
+          [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ] && TG_ARN=$(aws elbv2 describe-target-groups --names $TG_NAME --query 'TargetGroups[0].TargetGroupArn' --output text)
+          set -e
+
+          echo "==> ALB"
+          set +e
+          ALB_ARN=$(aws elbv2 create-load-balancer --name $ALB_NAME --type application --subnets $SUBNET1 $SUBNET2 --security-groups $ALB_SG_ID --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null)
+          [ -z "$ALB_ARN" ] || [ "$ALB_ARN" = "None" ] && ALB_ARN=$(aws elbv2 describe-load-balancers --names $ALB_NAME --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+          set -e
+          aws elbv2 wait load-balancer-available --load-balancer-arns $ALB_ARN
+          ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query 'LoadBalancers[0].DNSName' --output text)
+
+          echo "==> Listener 80 -> TG"
+          set +e
+          LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query 'Listeners[?Port==`80`].ListenerArn | [0]' --output text 2>/dev/null)
+          [ -z "$LISTENER_ARN" ] || [ "$LISTENER_ARN" = "None" ] && LISTENER_ARN=$(aws elbv2 create-listener --load-balancer-arn $ALB_ARN --protocol HTTP --port 80 --default-actions Type=forward,TargetGroupArn=$TG_ARN --query 'Listeners[0].ListenerArn' --output text)
+          set -e
+
+          echo "==> ECS cluster"
+          aws ecs create-cluster --cluster-name $CLUSTER_NAME >/dev/null 2>&1 || true
+
+          echo "==> IAM role for tasks"
+          if ! aws iam get-role --role-name ecsTaskExecutionRole >/dev/null 2>&1; then
+            printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}' > trust.json
+            aws iam create-role --role-name ecsTaskExecutionRole --assume-role-policy-document file://trust.json >/dev/null
+            aws iam attach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy >/dev/null
+          fi
+
+          echo "==> Logs group"
+          aws logs create-log-group --log-group-name /ecs/${FAMILY} >/dev/null 2>&1 || true
+
+          echo "==> Task definition"
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          cat > taskdef.json <<'JSON'
+          {
+            "family": "REPL_FAMILY",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "arn:aws:iam::REPL_ACCOUNT:role/ecsTaskExecutionRole",
+            "taskRoleArn": "arn:aws:iam::REPL_ACCOUNT:role/ecsTaskExecutionRole",
+            "containerDefinitions": [{
+              "name": "REPL_CONTAINER",
+              "image": "REPL_IMAGE",
+              "essential": true,
+              "portMappings": [{ "containerPort": REPL_PORT, "protocol": "tcp" }],
+              "environment": [{ "name": "DATABASE_URL", "value": "REPL_DBURL" }],
+              "logConfiguration": { "logDriver":"awslogs", "options": {
+                "awslogs-create-group":"true",
+                "awslogs-group":"/ecs/REPL_FAMILY",
+                "awslogs-region":"REPL_REGION",
+                "awslogs-stream-prefix":"ecs"
+              }}
+            }]
+          }
+          JSON
+          sed -i "s|REPL_ACCOUNT|$ACCOUNT_ID|g; s|REPL_FAMILY|$FAMILY|g; s|REPL_CONTAINER|$CONTAINER_NAME|g; s|REPL_IMAGE|$IMAGE|g; s|REPL_PORT|$CONTAINER_PORT|g; s|REPL_DBURL|$DATABASE_URL|g; s|REPL_REGION|$AWS_REGION|g" taskdef.json
+
+          aws ecs register-task-definition --cli-input-json file://taskdef.json >/dev/null
+
+          echo "==> Service create/update"
+          set +e
+          STATUS=$(aws ecs describe-services --cluster $CLUSTER_NAME --services $SERVICE_NAME --query 'services[0].status' --output text 2>/dev/null)
+          set -e
+          if [ "$STATUS" = "ACTIVE" ]; then
+            aws ecs update-service --cluster "$CLUSTER_NAME" --service "$SERVICE_NAME" --force-new-deployment >/dev/null
+          else
+            aws ecs create-service \
+              --cluster "$CLUSTER_NAME" \
+              --service-name "$SERVICE_NAME" \
+              --task-definition "$FAMILY" \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],securityGroups=[$ECS_SG_ID],assignPublicIp=ENABLED}" \
+              --load-balancers "targetGroupArn=$TG_ARN,containerName=$CONTAINER_NAME,containerPort=$CONTAINER_PORT" >/dev/null
+          fi
+
+          echo "==> (optional) розв'язуємо доступ ECS -> RDS"
+          # відкриваємо 3306 з ECS_SG у SG RDS-інстансу (разово; якщо вже відкрито — проскочить)
+          RDS_SG=$(aws rds describe-db-instances --db-instance-identifier database-lab-1 --query 'DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId' --output text)
+          aws ec2 authorize-security-group-ingress --group-id "$RDS_SG" --protocol tcp --port 3306 --source-group "$ECS_SG_ID" >/dev/null 2>&1 || true
+
+          echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
+          echo "Swagger URL:  http://$ALB_DNS$HEALTH_PATH"
+
+      - name: Wait service stable
+        run: |
+          aws ecs wait services-stable --cluster "$CLUSTER_NAME" --services "$SERVICE_NAME"
+          echo "Service is stable."
+
+  loadgen-once:
+    runs-on: ubuntu-latest
+    needs: [all-in-one]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure ECR for loadgen
+        run: |
+          aws ecr describe-repositories --repository-names "$LOADGEN_REPO" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "$LOADGEN_REPO" >/dev/null
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Prepare loadgen context (auto-generate if absent)
+        run: |
+          mkdir -p loadgen
+          cat > loadgen/Dockerfile <<'DOCKER'
+          FROM python:3.11-slim
+          WORKDIR /app
+          RUN pip install --no-cache-dir requests
+          COPY attack.py .
+          ENV TARGET=http://example.com/swagger
+          ENV CONCURRENCY=200
+          ENV DURATION=600
+          CMD ["python", "attack.py"]
+          DOCKER
+
+          cat > loadgen/attack.py <<'PY'
+          import os, time, threading, requests
+          from queue import Queue
+          TARGET = os.getenv("TARGET", "http://localhost:8000/swagger")
+          CONCURRENCY = int(os.getenv("CONCURRENCY", "200"))
+          DURATION = int(os.getenv("DURATION", "600"))
+
+          def worker(q):
+              s = requests.Session()
+              while True:
+                  try:
+                      url = q.get(timeout=1)
+                  except:
+                      return
+                  try:
+                      s.get(url, timeout=5)
+                  except Exception:
+                      pass
+                  finally:
+                      q.task_done()
+
+          def main():
+              end = time.time() + DURATION
+              q = Queue(maxsize=10000)
+              threads = [threading.Thread(target=worker, args=(q,), daemon=True) for _ in range(CONCURRENCY)]
+              [t.start() for t in threads]
+              while time.time() < end:
+                  q.put(TARGET)
+              q.join()
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Build & push loadgen image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/$LOADGEN_REPO:latest loadgen
+          docker push $ECR_REGISTRY/$LOADGEN_REPO:latest
+          echo "LOADGEN_IMAGE=$ECR_REGISTRY/$LOADGEN_REPO:latest" >> $GITHUB_ENV
+          echo "TARGET_URL=http://${{ needs.all-in-one.outputs.alb_dns }}${{ env.HEALTH_PATH }}" >> $GITHUB_ENV
+
+      - name: Run one-off loadgen task (Fargate)
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+          SUBNETS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC_ID --query 'Subnets[?MapPublicIpOnLaunch==`true`].SubnetId' --output text)
+          SUBNET1=$(echo $SUBNETS | awk '{print $1}')
+          SUBNET2=$(echo $SUBNETS | awk '{print $2}')
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          cat > lg-taskdef.json <<'JSON'
+          {
+            "family": "lab5b-loadgen-task",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "arn:aws:iam::REPL_ACCOUNT:role/ecsTaskExecutionRole",
+            "containerDefinitions": [{
+              "name": "loadgen",
+              "image": "REPL_IMAGE",
+              "essential": true,
+              "environment": [
+                { "name": "TARGET", "value": "REPL_TARGET" },
+                { "name": "CONCURRENCY", "value": "REPL_CONCURRENCY" },
+                { "name": "DURATION", "value": "REPL_DURATION" }
+              ]
+            }]
+          }
+          JSON
+          sed -i "s|REPL_ACCOUNT|$ACCOUNT_ID|g; s|REPL_IMAGE|$LOADGEN_IMAGE|g; s|REPL_TARGET|$TARGET_URL|g; s|REPL_CONCURRENCY|$LOADGEN_CONCURRENCY|g; s|REPL_DURATION|$LOADGEN_DURATION|g" lg-taskdef.json
+
+          aws ecs register-task-definition --cli-input-json file://lg-taskdef.json >/dev/null
+
+          aws ecs run-task \
+            --launch-type FARGATE \
+            --cluster "$CLUSTER_NAME" \
+            --task-definition "lab5b-loadgen-task" \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}" >/dev/null
+
+          echo "Started loadgen against: $TARGET_URL"
