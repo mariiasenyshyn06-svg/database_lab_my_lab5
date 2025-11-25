@@ -1,0 +1,481 @@
+name: Lab3
+
+on:
+  push:
+    branches: ["lab-5"]
+
+env:
+  AWS_REGION: eu-central-1
+
+  # ==== RDS
+  DB_INSTANCE_ID: iotlab-db
+  DB_INSTANCE_CLASS: db.t4g.micro
+  DB_STORAGE: "20"
+  DB_ENGINE: mysql
+  DB_ENGINE_VERSION: "8.0"
+  DB_NAME: iotlab
+  DB_USER: admin
+  DB_PASS: "NewStrongPass!123"
+  RDS_SG_NAME: iotlab-rds-sg
+
+  # ==== SQS ====
+  QUEUE_NAME: iot-events-queue
+  DLQ_NAME: iot-events-dlq
+  MAX_RECEIVE_COUNT: "5"
+
+  # ==== Lambda ====
+  L_INGRESS: iot-ingress
+  L_PROCESSOR: iot-processor
+  L_HISTORY: iot-history
+  L_DLQ_HANDLER: iot-dlq-handler
+
+  # ==== Emulator (ECS Fargate) ====
+  ECR_REPO: iot-emulator
+  CLUSTER: iotlab-cluster
+  FAMILY: iot-emulator-task
+  CONTAINER: iot-emulator
+  CPU: "256"
+  MEMORY: "512"
+
+  #емулювання (20..100 ms)
+  DURATION: "60"
+  TEMP_EVERY_MS: "30"
+  HUM_EVERY_MS: "50"
+  LIGHT_EVERY_MS: "80"
+  TEMP_LAT: "49.8397"
+  TEMP_LON: "24.0297"
+  HUM_LAT: "50.4501"
+  HUM_LON: "30.5234"
+  LIGHT_LAT: "48.3794"
+  LIGHT_LON: "31.1656"
+
+jobs:
+  iot-lab:
+    runs-on: ubuntu-latest
+    outputs:
+      INGRESS_URL: ${{ steps.outs.outputs.INGRESS_URL }}
+      HISTORY_URL: ${{ steps.outs.outputs.HISTORY_URL }}
+      DB_ENDPOINT: ${{ steps.rds.outputs.DB_ENDPOINT }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS (eu-central-1)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ---------- Network / VPC helpers ----------
+      - name: Detect default VPC + 2 public subnets
+        id: vpc
+        shell: bash
+        run: |
+          set -e
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+          if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
+            echo "Default VPC is required in ${AWS_REGION}"; exit 1
+          fi
+          SUBNETS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC_ID --query 'Subnets[?MapPublicIpOnLaunch==`true`].SubnetId' --output text)
+          SUBNET1=$(echo $SUBNETS | awk '{print $1}')
+          SUBNET2=$(echo $SUBNETS | awk '{print $2}')
+          if [ -z "$SUBNET1" ] || [ -z "$SUBNET2" ]; then
+            echo "Need >=2 public subnets in default VPC"; exit 1
+          fi
+          echo "VPC_ID=$VPC_ID"     >> $GITHUB_OUTPUT
+          echo "SUBNET1=$SUBNET1"   >> $GITHUB_OUTPUT
+          echo "SUBNET2=$SUBNET2"   >> $GITHUB_OUTPUT
+
+      # ---------- RDS MySQL ----------
+      - name: Create RDS security group (3306)
+        id: rdssg
+        shell: bash
+        run: |
+          set -e
+          VPC_ID="${{ steps.vpc.outputs.VPC_ID }}"
+          SG_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values=$RDS_SG_NAME Name=vpc-id,Values=$VPC_ID --query 'SecurityGroups[0].GroupId' --output text)
+          if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
+            SG_ID=$(aws ec2 create-security-group --group-name "$RDS_SG_NAME" --description "RDS SG for iotlab" --vpc-id "$VPC_ID" --query 'GroupId' --output text)
+          fi
+          # Відкриваємо 3306 назовні (ДЛЯ ДЕМО!). Після захисту закрий.
+          aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 3306 --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
+          echo "RDS_SG_ID=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Create RDS MySQL instance
+        id: rds
+        shell: bash
+        run: |
+          set -e
+          # якщо вже існує — скіп
+          if ! aws rds describe-db-instances --db-instance-identifier "$DB_INSTANCE_ID" >/dev/null 2>&1; then
+            aws rds create-db-instance \
+              --db-instance-identifier "$DB_INSTANCE_ID" \
+              --db-instance-class "$DB_INSTANCE_CLASS" \
+              --engine "$DB_ENGINE" \
+              --engine-version "$DB_ENGINE_VERSION" \
+              --allocated-storage "$DB_STORAGE" \
+              --master-username "$DB_USER" \
+              --master-user-password "$DB_PASS" \
+              --db-name "$DB_NAME" \
+              --publicly-accessible \
+              --storage-type gp3 \
+              --backup-retention-period 0 \
+              --no-multi-az \
+              --vpc-security-group-ids "${{ steps.rdssg.outputs.RDS_SG_ID }}" >/dev/null
+          fi
+          aws rds wait db-instance-available --db-instance-identifier "$DB_INSTANCE_ID"
+          DB_ENDPOINT=$(aws rds describe-db-instances --db-instance-identifier "$DB_INSTANCE_ID" --query 'DBInstances[0].Endpoint.Address' --output text)
+          echo "DB_ENDPOINT=$DB_ENDPOINT" >> $GITHUB_OUTPUT
+          echo "RDS endpoint: $DB_ENDPOINT"
+
+      # ---------- SQS + DLQ ----------
+      - name: Create SQS + DLQ
+        id: sqs
+        shell: bash
+        run: |
+          set -e
+          DLQ_URL=$(aws sqs create-queue --queue-name "$DLQ_NAME" \
+                      --attributes MessageRetentionPeriod=1209600 \
+                      --query 'QueueUrl' --output text 2>/dev/null || true)
+          [ -z "$DLQ_URL" ] && DLQ_URL=$(aws sqs get-queue-url --queue-name "$DLQ_NAME" --query 'QueueUrl' --output text)
+          DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
+
+          REDRIVE=$(printf '{"deadLetterTargetArn":"%s","maxReceiveCount":"%s"}' "$DLQ_ARN" "$MAX_RECEIVE_COUNT")
+          Q_URL=$(aws sqs create-queue --queue-name "$QUEUE_NAME" \
+                      --attributes RedrivePolicy="$REDRIVE" \
+                      --query 'QueueUrl' --output text 2>/dev/null || true)
+          [ -z "$Q_URL" ] && Q_URL=$(aws sqs get-queue-url --queue-name "$QUEUE_NAME" --query 'QueueUrl' --output text)
+          Q_ARN=$(aws sqs get-queue-attributes --queue-url "$Q_URL" --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
+
+          echo "DLQ_URL=$DLQ_URL" >> $GITHUB_OUTPUT
+          echo "DLQ_ARN=$DLQ_ARN" >> $GITHUB_OUTPUT
+          echo "Q_URL=$Q_URL"     >> $GITHUB_OUTPUT
+          echo "Q_ARN=$Q_ARN"     >> $GITHUB_OUTPUT
+
+      # ---------- IAM for Lambdas ----------
+      - name: Create IAM role for Lambdas
+        id: iam
+        shell: bash
+        run: |
+          set -e
+          cat > trust.json <<'JSON'
+          {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+          JSON
+          if ! aws iam get-role --role-name iotlab-lambda-role >/dev/null 2>&1; then
+            aws iam create-role --role-name iotlab-lambda-role --assume-role-policy-document file://trust.json >/dev/null
+            aws iam attach-role-policy --role-name iotlab-lambda-role --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole >/dev/null
+          fi
+
+          cat > sqs-policy.json <<JSON
+          {"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["sqs:SendMessage","sqs:GetQueueAttributes","sqs:GetQueueUrl","sqs:ReceiveMessage","sqs:DeleteMessage"],
+             "Resource":["${{ steps.sqs.outputs.Q_ARN }}","${{ steps.sqs.outputs.DLQ_ARN }}"]}
+          ]}
+          JSON
+          aws iam create-policy --policy-name iotlab-sqs-inline --policy-document file://sqs-policy.json >/dev/null 2>&1 || true
+          POLICY_ARN=$(aws iam list-policies --query 'Policies[?PolicyName==`iotlab-sqs-inline`].Arn' --output text | head -n1)
+          aws iam attach-role-policy --role-name iotlab-lambda-role --policy-arn "$POLICY_ARN" >/dev/null 2>&1 || true
+          ROLE_ARN=$(aws iam get-role --role-name iotlab-lambda-role --query 'Role.Arn' --output text)
+          echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_OUTPUT
+
+      # ---------- Build Lambdas ----------
+      - name: Build ingress lambda (HTTP -> SQS)
+        run: |
+          set -e
+          mkdir -p build/ingress
+          cat > build/ingress/lambda_function.py <<'PY'
+          import os, json, boto3
+          sqs = boto3.client("sqs")
+          QUEUE_URL = os.environ["QUEUE_URL"]
+          def _ok(body): return {"statusCode":200,"headers":{"Content-Type":"application/json"},"body":json.dumps(body)}
+          def lambda_handler(event, context):
+              body = event.get("body","")
+              if not body: return _ok({"ok":False,"error":"empty body"})
+              try: json.loads(body)
+              except Exception: return _ok({"ok":False,"error":"invalid json"})
+              sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=body)
+              return _ok({"ok":True})
+          PY
+          (cd build/ingress && zip -r ../ingress.zip . >/dev/null)
+
+      - name: Build processor lambda (SQS -> RDS)
+        run: |
+          set -e
+          mkdir -p build/processor
+          echo 'PyMySQL==1.1.0' > build/processor/requirements.txt
+          python -m pip install --upgrade pip >/dev/null
+          pip install -r build/processor/requirements.txt -t build/processor >/dev/null
+          cat > build/processor/lambda_function.py <<'PY'
+          import os, json, datetime, pymysql
+          DB_HOST=os.environ["DB_HOST"]; DB_NAME=os.environ["DB_NAME"]; DB_USER=os.environ["DB_USER"]; DB_PASS=os.environ["DB_PASS"]
+          def _conn(): return pymysql.connect(host=DB_HOST,user=DB_USER,password=DB_PASS,database=DB_NAME,autocommit=True,charset="utf8mb4",cursorclass=pymysql.cursors.DictCursor)
+          def _ensure(cur):
+              cur.execute("""CREATE TABLE IF NOT EXISTS sensors(id BIGINT AUTO_INCREMENT PRIMARY KEY,sensor_id VARCHAR(64) UNIQUE,sensor_type VARCHAR(32),lat DOUBLE,lon DOUBLE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;""")
+              cur.execute("""CREATE TABLE IF NOT EXISTS sensor_readings(id BIGINT AUTO_INCREMENT PRIMARY KEY,sensor_id VARCHAR(64),ts DATETIME,value DOUBLE,INDEX idx_sensor_ts (sensor_id, ts)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;""")
+          def _upsert_sensor(cur,sid,stype,lat,lon):
+              cur.execute("""INSERT INTO sensors(sensor_id,sensor_type,lat,lon) VALUES(%s,%s,%s,%s)
+                             ON DUPLICATE KEY UPDATE sensor_type=VALUES(sensor_type),lat=VALUES(lat),lon=VALUES(lon)""",(sid,stype,lat,lon))
+          def _insert(cur,sid,ts,val): cur.execute("INSERT INTO sensor_readings(sensor_id,ts,value) VALUES(%s,%s,%s)",(sid,ts,val))
+          def lambda_handler(event, context):
+              with _conn() as c:
+                  with c.cursor() as cur:
+                      _ensure(cur)
+                      for r in event.get("Records",[]):
+                          try: d=json.loads(r.get("body","{}"))
+                          except: continue
+                          st=d.get("sensorType"); sid=d.get("sensorId"); val=float(d.get("value",0)); lat=float(d.get("lat",0)); lon=float(d.get("lon",0))
+                          ts=d.get("ts"); ts=(ts.replace("T"," ").split(".")[0] if ts else datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+                          if not (st and sid): continue
+                          _upsert_sensor(cur,sid,st,lat,lon); _insert(cur,sid,ts,val)
+              return {"statusCode":200}
+          PY
+          (cd build/processor && zip -r ../processor.zip . >/dev/null)
+
+      - name: Build history lambda (HTTP -> MySQL SELECT)
+        run: |
+          set -e
+          mkdir -p build/history
+          echo 'PyMySQL==1.1.0' > build/history/requirements.txt
+          pip install -r build/history/requirements.txt -t build/history >/dev/null
+          cat > build/history/lambda_function.py <<'PY'
+          import os, json, pymysql
+          DB_HOST=os.environ["DB_HOST"]; DB_NAME=os.environ["DB_NAME"]; DB_USER=os.environ["DB_USER"]; DB_PASS=os.environ["DB_PASS"]
+          def _conn(): return pymysql.connect(host=DB_HOST,user=DB_USER,password=DB_PASS,database=DB_NAME,autocommit=True,charset="utf8mb4",cursorclass=pymysql.cursors.DictCursor)
+          def lambda_handler(event, context):
+              qs=event.get("queryStringParameters") or {}
+              sensor_id=qs.get("sensorId"); sensor_type=qs.get("sensorType"); limit=int(qs.get("limit","50")); limit=max(1,min(limit,1000))
+              where=[]; args=[]
+              if sensor_id: where.append("sr.sensor_id=%s") or args.append(sensor_id)
+              if sensor_type: where.append("s.sensor_type=%s") or args.append(sensor_type)
+              sql="SELECT sr.sensor_id,s.sensor_type,sr.ts,sr.value,s.lat,s.lon FROM sensor_readings sr JOIN sensors s ON s.sensor_id=sr.sensor_id"
+              if where: sql+=" WHERE "+ " AND ".join(where)
+              sql+=" ORDER BY sr.ts DESC LIMIT %s"; args.append(limit)
+              with _conn() as c:
+                  with c.cursor() as cur:
+                      cur.execute(sql,tuple(args)); rows=cur.fetchall()
+              return {"statusCode":200,"headers":{"Content-Type":"application/json"},"body":json.dumps(rows,default=str)}
+          PY
+          (cd build/history && zip -r ../history.zip . >/dev/null)
+
+      # ---------- Deploy Lambdas ----------
+      - name: Deploy Lambdas
+        id: lambdas
+        shell: bash
+        env:
+          ROLE_ARN: ${{ steps.iam.outputs.ROLE_ARN }}
+        run: |
+          set -e
+          # ingress
+          if ! aws lambda get-function --function-name "$L_INGRESS" >/dev/null 2>&1; then
+            aws lambda create-function --function-name "$L_INGRESS" --runtime python3.11 --role "$ROLE_ARN" --handler lambda_function.lambda_handler --zip-file fileb://build/ingress.zip >/dev/null
+          else
+            aws lambda update-function-code --function-name "$L_INGRESS" --zip-file fileb://build/ingress.zip >/dev/null
+          fi
+          aws lambda update-function-configuration --function-name "$L_INGRESS" --environment "Variables={QUEUE_URL=${{ steps.sqs.outputs.Q_URL }}}" >/dev/null
+
+          # processor
+          if ! aws lambda get-function --function-name "$L_PROCESSOR" >/dev/null 2>&1; then
+            aws lambda create-function --function-name "$L_PROCESSOR" --runtime python3.11 --role "$ROLE_ARN" --handler lambda_function.lambda_handler --zip-file fileb://build/processor.zip >/dev/null
+          else
+            aws lambda update-function-code --function-name "$L_PROCESSOR" --zip-file fileb://build/processor.zip >/dev/null
+          fi
+          aws lambda update-function-configuration --function-name "$L_PROCESSOR" \
+            --environment "Variables={DB_HOST=${{ steps.rds.outputs.DB_ENDPOINT }},DB_NAME=${DB_NAME},DB_USER=${DB_USER},DB_PASS=${DB_PASS}}" >/dev/null
+
+          # history
+          if ! aws lambda get-function --function-name "$L_HISTORY" >/dev/null 2>&1; then
+            aws lambda create-function --function-name "$L_HISTORY" --runtime python3.11 --role "$ROLE_ARN" --handler lambda_function.lambda_handler --zip-file fileb://build/history.zip >/dev/null
+          else
+            aws lambda update-function-code --function-name "$L_HISTORY" --zip-file fileb://build/history.zip >/dev/null
+          fi
+          aws lambda update-function-configuration --function-name "$L_HISTORY" \
+            --environment "Variables={DB_HOST=${{ steps.rds.outputs.DB_ENDPOINT }},DB_NAME=${DB_NAME},DB_USER=${DB_USER},DB_PASS=${DB_PASS}}" >/dev/null
+
+      - name: Create Lambda URLs (ingress/history)
+        id: urls
+        shell: bash
+        run: |
+          set -e
+          if ! aws lambda get-function-url-config --function-name "$L_INGRESS" >/dev/null 2>&1; then
+            aws lambda create-function-url-config --function-name "$L_INGRESS" --auth-type NONE >/dev/null
+          fi
+          INGRESS_URL=$(aws lambda get-function-url-config --function-name "$L_INGRESS" --query 'FunctionUrl' --output text)
+
+          if ! aws lambda get-function-url-config --function-name "$L_HISTORY" >/dev/null 2>&1; then
+            aws lambda create-function-url-config --function-name "$L_HISTORY" --auth-type NONE >/dev/null
+          fi
+          HISTORY_URL=$(aws lambda get-function-url-config --function-name "$L_HISTORY" --query 'FunctionUrl' --output text)
+
+          echo "INGRESS_URL=$INGRESS_URL" >> $GITHUB_OUTPUT
+          echo "HISTORY_URL=$HISTORY_URL" >> $GITHUB_OUTPUT
+          echo "Ingress URL:  $INGRESS_URL"
+          echo "History URL:  $HISTORY_URL"
+
+      - name: Event source SQS -> processor
+        shell: bash
+        run: |
+          set -e
+          Q_ARN="${{ steps.sqs.outputs.Q_ARN }}"
+          FN="$L_PROCESSOR"
+          EXISTS=$(aws lambda list-event-source-mappings --function-name "$FN" --query "EventSourceMappings[?EventSourceArn=='$Q_ARN'] | length(@)")
+          if [ "$EXISTS" = "0" ]; then
+            aws lambda create-event-source-mapping --function-name "$FN" --event-source-arn "$Q_ARN" --batch-size 10 >/dev/null
+          fi
+
+      # ---------- DLQ handler ----------
+      - name: Deploy DLQ handler
+        shell: bash
+        env:
+          ROLE_ARN: ${{ steps.iam.outputs.ROLE_ARN }}
+        run: |
+          set -e
+          mkdir -p build/dlq
+          cat > build/dlq/lambda_function.py <<'PY'
+          import json, logging
+          log=logging.getLogger(__name__); log.setLevel(logging.INFO)
+          def lambda_handler(event, context):
+              log.info("DLQ event: %s", json.dumps(event))
+              return {"statusCode":200}
+          PY
+          (cd build/dlq && zip -r ../dlq.zip . >/dev/null)
+
+          if ! aws lambda get-function --function-name "$L_DLQ_HANDLER" >/dev/null 2>&1; then
+            aws lambda create-function --function-name "$L_DLQ_HANDLER" --runtime python3.11 --role "$ROLE_ARN" --handler lambda_function.lambda_handler --zip-file fileb://build/dlq.zip >/dev/null
+          else
+            aws lambda update-function-code --function-name "$L_DLQ_HANDLER" --zip-file fileb://build/dlq.zip >/dev/null
+          fi
+          DLQ_ARN="${{ steps.sqs.outputs.DLQ_ARN }}"
+          EXISTS=$(aws lambda list-event-source-mappings --function-name "$L_DLQ_HANDLER" --query "EventSourceMappings[?EventSourceArn=='$DLQ_ARN'] | length(@)")
+          if [ "$EXISTS" = "0" ]; then
+            aws lambda create-event-source-mapping --function-name "$L_DLQ_HANDLER" --event-source-arn "$DLQ_ARN" --batch-size 10 >/dev/null
+          fi
+
+      # ---------- Emulator (ECR + ECS Fargate one-off) ----------
+      - name: Ensure ECR + ECS cluster
+        id: ecr
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPO" >/dev/null 2>&1 || aws ecr create-repository --repository-name "$ECR_REPO" >/dev/null
+          aws ecs create-cluster --cluster-name "$CLUSTER" >/dev/null 2>&1 || true
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        id: ecrlogin
+
+      - name: Build & push emulator image
+        env:
+          ECR_REGISTRY: ${{ steps.ecrlogin.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -e
+          mkdir -p emulator
+          cat > emulator/Dockerfile <<'DOCKER'
+          FROM python:3.11-slim
+          WORKDIR /app
+          RUN pip install --no-cache-dir requests
+          COPY emulator.py .
+          ENV INGRESS_URL=""
+          ENV DURATION=60
+          ENV TEMP_EVERY_MS=30 HUM_EVERY_MS=50 LIGHT_EVERY_MS=80
+          ENV TEMP_LAT=0 TEMP_LON=0 HUM_LAT=0 HUM_LON=0 LIGHT_LAT=0 LIGHT_LON=0
+          CMD ["python", "emulator.py"]
+          DOCKER
+
+          cat > emulator/emulator.py <<'PY'
+          import os, time, json, threading, random, requests
+          from datetime import datetime, timezone
+          INGRESS_URL=os.getenv("INGRESS_URL",""); DURATION=int(os.getenv("DURATION","60"))
+          TEMP_EVERY=max(20,int(os.getenv("TEMP_EVERY_MS","30")))/1000.0
+          HUM_EVERY =max(20,int(os.getenv("HUM_EVERY_MS","50")))/1000.0
+          LIGHT_EVERY=max(20,int(os.getenv("LIGHT_EVERY_MS","80")))/1000.0
+          TEMP_LAT=float(os.getenv("TEMP_LAT","0")); TEMP_LON=float(os.getenv("TEMP_LON","0"))
+          HUM_LAT=float(os.getenv("HUM_LAT","0"));   HUM_LON=float(os.getenv("HUM_LON","0"))
+          LIGHT_LAT=float(os.getenv("LIGHT_LAT","0")); LIGHT_LON=float(os.getenv("LIGHT_LON","0"))
+          def now_iso(): return datetime.now(timezone.utc).isoformat()
+          def send(p): 
+              try: requests.post(INGRESS_URL, data=json.dumps(p), timeout=2)
+              except Exception: pass
+          def run_sensor(sid, st, every, lat, lon, gen):
+              end=time.time()+DURATION
+              while time.time()<end:
+                  send({"sensorId":sid,"sensorType":st,"value":gen(),"lat":lat,"lon":lon,"ts":now_iso()})
+                  time.sleep(every)
+          def main():
+              if not INGRESS_URL: print("No INGRESS_URL"); return
+              threads=[
+                threading.Thread(target=run_sensor,args=("temp-1","temperature",TEMP_EVERY,TEMP_LAT,TEMP_LON,lambda: round(random.uniform(18.0,28.0),2)),daemon=True),
+                threading.Thread(target=run_sensor,args=("hum-1","humidity",HUM_EVERY,HUM_LAT,HUM_LON,lambda: round(random.uniform(35.0,70.0),1)),daemon=True),
+                threading.Thread(target=run_sensor,args=("light-1","light",LIGHT_EVERY,LIGHT_LAT,LIGHT_LON,lambda: random.randint(100,900)),daemon=True),
+              ]
+              [t.start() for t in threads]; [t.join() for t in threads]
+          if __name__=="__main__": main()
+          PY
+
+          docker build -t $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG emulator
+          docker tag $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPO:latest
+          docker push $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPO:latest
+          echo "IMAGE=$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Task def + run emulator task
+        env:
+          INGRESS_URL: ${{ steps.urls.outputs.INGRESS_URL }}
+        run: |
+          set -e
+          VPC_ID="${{ steps.vpc.outputs.VPC_ID }}"
+          SUBNET1="${{ steps.vpc.outputs.SUBNET1 }}"
+          SUBNET2="${{ steps.vpc.outputs.SUBNET2 }}"
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          aws logs create-log-group --log-group-name /ecs/${FAMILY} >/dev/null 2>&1 || true
+          if ! aws iam get-role --role-name ecsTaskExecutionRole >/dev/null 2>&1; then
+            printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}' > trust.json
+            aws iam create-role --role-name ecsTaskExecutionRole --assume-role-policy-document file://trust.json >/dev/null
+            aws iam attach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy >/dev/null
+          fi
+
+          cat > taskdef.json <<JSON
+          {
+            "family": "${FAMILY}",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "${CPU}",
+            "memory": "${MEMORY}",
+            "executionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole",
+            "containerDefinitions": [{
+              "name": "${CONTAINER}",
+              "image": "${IMAGE}",
+              "essential": true,
+              "environment": [
+                {"name":"INGRESS_URL","value":"${INGRESS_URL}"},
+                {"name":"DURATION","value":"${DURATION}"},
+                {"name":"TEMP_EVERY_MS","value":"${TEMP_EVERY_MS}"},
+                {"name":"HUM_EVERY_MS","value":"${HUM_EVERY_MS}"},
+                {"name":"LIGHT_EVERY_MS","value":"${LIGHT_EVERY_MS}"},
+                {"name":"TEMP_LAT","value":"${TEMP_LAT}"},
+                {"name":"TEMP_LON","value":"${TEMP_LON}"},
+                {"name":"HUM_LAT","value":"${HUM_LAT}"},
+                {"name":"HUM_LON","value":"${HUM_LON}"},
+                {"name":"LIGHT_LAT","value":"${LIGHT_LAT}"},
+                {"name":"LIGHT_LON","value":"${LIGHT_LON}"}
+              ],
+              "logConfiguration": {"logDriver":"awslogs","options":{"awslogs-group":"/ecs/${FAMILY}","awslogs-region":"${AWS_REGION}","awslogs-stream-prefix":"ecs"}}
+            }]
+          }
+          JSON
+
+          aws ecs register-task-definition --cli-input-json file://taskdef.json >/dev/null
+          aws ecs run-task --cluster "$CLUSTER" --launch-type FARGATE --task-definition "$FAMILY" \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}" >/dev/null
+          echo "Emulator started for ${DURATION}s ..."
+
+      - name: Output URLs
+        id: outs
+        run: |
+          echo "INGRESS_URL=${{ steps.urls.outputs.INGRESS_URL }}" >> $GITHUB_OUTPUT
+          echo "HISTORY_URL=${{ steps.urls.outputs.HISTORY_URL }}" >> $GITHUB_OUTPUT
+          echo "DB_ENDPOINT=${{ steps.rds.outputs.DB_ENDPOINT }}" >> $GITHUB_OUTPUT
+          echo "Ingress:  ${{ steps.urls.outputs.INGRESS_URL }}"
+          echo "History:  ${{ steps.urls.outputs.HISTORY_URL }}"
+          echo "RDS:      ${{ steps.rds.outputs.DB_ENDPOINT }}"
