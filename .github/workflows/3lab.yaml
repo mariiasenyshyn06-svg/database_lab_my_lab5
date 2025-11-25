@@ -132,27 +132,60 @@ jobs:
 
       # ---------- SQS + DLQ ----------
       - name: Create SQS + DLQ
-        id: sqs
-        shell: bash
         run: |
           set -e
-          DLQ_URL=$(aws sqs create-queue --queue-name "$DLQ_NAME" \
-                      --attributes MessageRetentionPeriod=1209600 \
-                      --query 'QueueUrl' --output text 2>/dev/null || true)
-          [ -z "$DLQ_URL" ] && DLQ_URL=$(aws sqs get-queue-url --queue-name "$DLQ_NAME" --query 'QueueUrl' --output text)
-          DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
 
-          REDRIVE=$(printf '{"deadLetterTargetArn":"%s","maxReceiveCount":"%s"}' "$DLQ_ARN" "$MAX_RECEIVE_COUNT")
-          Q_URL=$(aws sqs create-queue --queue-name "$QUEUE_NAME" \
-                      --attributes RedrivePolicy="$REDRIVE" \
-                      --query 'QueueUrl' --output text 2>/dev/null || true)
-          [ -z "$Q_URL" ] && Q_URL=$(aws sqs get-queue-url --queue-name "$QUEUE_NAME" --query 'QueueUrl' --output text)
-          Q_ARN=$(aws sqs get-queue-attributes --queue-url "$Q_URL" --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
+          echo "==> Create DLQ (idempotent)"
+          aws sqs create-queue \
+            --queue-name "$SQS_DLQ_NAME" \
+            --region "$AWS_REGION" >/dev/null 2>&1 || true
 
-          echo "DLQ_URL=$DLQ_URL" >> $GITHUB_OUTPUT
-          echo "DLQ_ARN=$DLQ_ARN" >> $GITHUB_OUTPUT
-          echo "Q_URL=$Q_URL"     >> $GITHUB_OUTPUT
-          echo "Q_ARN=$Q_ARN"     >> $GITHUB_OUTPUT
+          DLQ_URL=$(aws sqs get-queue-url \
+            --queue-name "$SQS_DLQ_NAME" \
+            --region "$AWS_REGION" \
+            --query 'QueueUrl' --output text)
+
+          DLQ_ARN=$(aws sqs get-queue-attributes \
+            --queue-url "$DLQ_URL" \
+            --region "$AWS_REGION" \
+            --attribute-names QueueArn \
+            --query 'Attributes.QueueArn' --output text)
+
+          echo "DLQ_URL=$DLQ_URL"
+          echo "DLQ_ARN=$DLQ_ARN"
+
+          echo "==> Create main queue with RedrivePolicy (idempotent)"
+          aws sqs create-queue \
+            --queue-name "$SQS_QUEUE_NAME" \
+            --region "$AWS_REGION" \
+            --attributes RedrivePolicy="{\"deadLetterTargetArn\":\"$DLQ_ARN\",\"maxReceiveCount\":\"5\"}" >/dev/null 2>&1 || true
+
+          QUEUE_URL=$(aws sqs get-queue-url \
+            --queue-name "$SQS_QUEUE_NAME" \
+            --region "$AWS_REGION" \
+            --query 'QueueUrl' --output text)
+
+          aws sqs set-queue-attributes \
+            --queue-url "$QUEUE_URL" \
+            --region "$AWS_REGION" \
+            --attributes RedrivePolicy="{\"deadLetterTargetArn\":\"$DLQ_ARN\",\"maxReceiveCount\":\"5\"}"
+
+          SRC_ARN=$(aws sqs get-queue-attributes \
+            --queue-url "$QUEUE_URL" \
+            --region "$AWS_REGION" \
+            --attribute-names QueueArn \
+            --query 'Attributes.QueueArn' --output text)
+          aws sqs set-queue-attributes \
+            --queue-url "$DLQ_URL" \
+            --region "$AWS_REGION" \
+            --attributes RedriveAllowPolicy="{\"redrivePermission\":\"byQueue\",\"sourceQueueArns\":[\"$SRC_ARN\"]}" >/dev/null 2>&1 || true
+
+          echo "SQS_QUEUE_URL=$QUEUE_URL" >> $GITHUB_ENV
+          echo "SQS_DLQ_URL=$DLQ_URL"   >> $GITHUB_ENV
+
+          echo "Main queue: $QUEUE_URL"
+          echo "DLQ:        $DLQ_URL"
+
 
       # ---------- IAM for Lambdas ----------
       - name: Create IAM role for Lambdas
