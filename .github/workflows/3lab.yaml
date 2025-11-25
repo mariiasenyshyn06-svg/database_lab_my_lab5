@@ -51,6 +51,7 @@ jobs:
 
       - name: Generate strong DB password (no extra GitHub secret)
         id: genpass
+        shell: bash
         run: |
           set -euo pipefail
           DB_PASS=$(python3 - <<'PY'
@@ -59,9 +60,8 @@ jobs:
           print(''.join(secrets.choice(alphabet) for _ in range(24)))
           PY
           )
-              echo "::add-mask::$DB_PASS"
-              echo "DB_PASS=$DB_PASS" >> $GITHUB_ENV
-
+          echo "::add-mask::$DB_PASS"
+          echo "DB_MASTER_PASS=$DB_PASS" >> "$GITHUB_ENV"
 
       - name: Resolve VPC + subnets
         id: vpc
@@ -107,7 +107,7 @@ jobs:
               --master-user-password "$DB_MASTER_PASS" \
               --vpc-security-group-ids "$RDS_SG_ID" \
               --db-name "$DB_NAME" \
-              --no-multi-az --publicly-accessible false \
+              --no-multi-az --no-publicly-accessible \
               --backup-retention-period 0 \
               --storage-type gp2
           fi
@@ -137,25 +137,29 @@ jobs:
           aws iam attach-role-policy --role-name "$LAMBDA_ROLE" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole >/dev/null 2>&1 || true
           aws iam attach-role-policy --role-name "$LAMBDA_ROLE" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole >/dev/null 2>&1 || true
           aws iam attach-role-policy --role-name "$LAMBDA_ROLE" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole >/dev/null 2>&1 || true
-          # Дозвіл інжест-ламбді відправляти в SQS
+
+          # Дозвіл інжест-ламбді відправляти в SQS (SendMessage)
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           cat > sqs-send.json <<EOF
           {
             "Version":"2012-10-17",
             "Statement":[{"Effect":"Allow","Action":["sqs:SendMessage"],"Resource":"$QUEUE_ARN"}]
           }
           EOF
-          if aws iam get-policy --policy-arn arn:aws:iam::${{ steps.account.outputs.id || '111111111111' }}:policy/iotlab-sqs-send >/dev/null 2>&1; then true; else true; fi
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           if ! aws iam get-policy --policy-arn arn:aws:iam::$ACCOUNT_ID:policy/iotlab-sqs-send >/dev/null 2>&1; then
             aws iam create-policy --policy-name iotlab-sqs-send --policy-document file://sqs-send.json >/dev/null
           fi
           aws iam attach-role-policy --role-name "$LAMBDA_ROLE" --policy-arn arn:aws:iam::$ACCOUNT_ID:policy/iotlab-sqs-send >/dev/null 2>&1 || true
+
           ROLE_ARN=$(aws iam get-role --role-name "$LAMBDA_ROLE" --query 'Role.Arn' --output text)
           echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
 
       - name: Build & deploy Lambdas (ingest -> SQS, consumer SQS -> MySQL)
         run: |
           set -e
+          # jq може бути не встановлений
+          jq --version >/dev/null 2>&1 || { sudo apt-get update -y && sudo apt-get install -y jq; }
+
           mkdir -p lambda_ingest lambda_consumer
 
           # -------- ingest (API -> SQS)
@@ -164,11 +168,14 @@ jobs:
           sqs = boto3.client('sqs')
           QUEUE_URL = os.environ['QUEUE_URL']
           def lambda_handler(event, context):
-              if event.get("isBase64Encoded"):
-                  body = json.loads(bytearray(event["body"], "utf-8").decode())
-              else:
-                  body = json.loads(event.get("body") or "{}")
-              # додаємо timestamp, якщо нема
+              body = event.get("body")
+              if isinstance(body, str):
+                  try:
+                      body = json.loads(body)
+                  except Exception:
+                      body = {"raw": body}
+              if not body:
+                  body = {}
               body.setdefault("ts", int(time.time()*1000))
               sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(body))
               return {"statusCode": 202, "headers":{"Content-Type":"application/json"}, "body": json.dumps({"ok": True})}
@@ -177,14 +184,11 @@ jobs:
           # -------- consumer (SQS -> MySQL)
           cat > lambda_consumer/handler.py <<'PY'
           import os, json, pymysql, time
-          DB_HOST = os.environ['DB_HOST']
-          DB_NAME = os.environ['DB_NAME']
-          DB_USER = os.environ['DB_USER']
-          DB_PASS = os.environ['DB_PASS']
-
+          DB_HOST, DB_NAME, DB_USER, DB_PASS = (
+            os.environ['DB_HOST'], os.environ['DB_NAME'], os.environ['DB_USER'], os.environ['DB_PASS']
+          )
           def _conn():
               return pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME, autocommit=True, charset="utf8mb4")
-
           def _init_schema(cur):
               cur.execute("""
               CREATE TABLE IF NOT EXISTS sensor_data (
@@ -196,7 +200,6 @@ jobs:
                 ts BIGINT NOT NULL
               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
               """)
-
           def lambda_handler(event, context):
               con = _conn()
               try:
@@ -206,47 +209,49 @@ jobs:
                           payload = json.loads(rec['body'])
                           cur.execute(
                             "INSERT INTO sensor_data(sensor_type, value, lat, lon, ts) VALUES(%s,%s,%s,%s,%s)",
-                            (
-                              payload.get('type'),
-                              float(payload.get('value', 0)),
-                              payload.get('lat'),
-                              payload.get('lon'),
-                              int(payload.get('ts', time.time()*1000))
-                            )
+                            (payload.get('type'), float(payload.get('value',0)), payload.get('lat'), payload.get('lon'), int(payload.get('ts', time.time()*1000)))
                           )
               finally:
                   con.close()
               return {"ok": True}
           PY
 
-          # Vendoring deps for consumer
+          # Layer із pymysql
           python -m pip install --upgrade pip >/dev/null
           pip install -q -t lambda_consumer/python pymysql
           (cd lambda_ingest && zip -rq ../ingest.zip .)
           (cd lambda_consumer && zip -rq ../consumer_layer.zip python)
           (cd lambda_consumer && zip -rq ../consumer_code.zip handler.py)
-
-          # Create/Update consumer layer
           LAYER_ARN=$(aws lambda publish-layer-version --layer-name iotlab-pymysql --zip-file fileb://consumer_layer.zip --compatible-runtimes python3.12 --query 'LayerVersionArn' --output text)
 
-          # Create/Update ingest function
+          # 🔧 Формуємо JSON для --environment через jq (щоб не ловити "Expected '=', got EOF")
+          ENV_INGEST=$(jq -n --arg q "$QUEUE_URL" '{Variables:{QUEUE_URL:$q}}')
+          ENV_CONS=$(jq -n \
+            --arg h "$DB_HOST" \
+            --arg n "$DB_NAME" \
+            --arg u "$DB_USER" \
+            --arg p "$DB_MASTER_PASS" \
+            '{Variables:{DB_HOST:$h,DB_NAME:$n,DB_USER:$u,DB_PASS:$p}}')
+
+          # Ingest
           if aws lambda get-function --function-name "$INGEST_LAMBDA" >/dev/null 2>&1; then
             aws lambda update-function-code --function-name "$INGEST_LAMBDA" --zip-file fileb://ingest.zip >/dev/null
+            aws lambda update-function-configuration --function-name "$INGEST_LAMBDA" --environment "$ENV_INGEST" >/dev/null
           else
             aws lambda create-function --function-name "$INGEST_LAMBDA" \
               --runtime python3.12 --handler handler.lambda_handler \
               --role "$ROLE_ARN" --timeout 15 --memory-size 128 \
               --zip-file fileb://ingest.zip \
-              --environment "Variables={QUEUE_URL=$QUEUE_URL}" >/dev/null
+              --environment "$ENV_INGEST" >/dev/null
           fi
 
-          # Create/Update consumer function (in VPC)
+          # Consumer (у VPC)
           if aws lambda get-function --function-name "$CONSUMER_LAMBDA" >/dev/null 2>&1; then
             aws lambda update-function-code --function-name "$CONSUMER_LAMBDA" --zip-file fileb://consumer_code.zip >/dev/null
             aws lambda update-function-configuration --function-name "$CONSUMER_LAMBDA" \
               --layers "$LAYER_ARN" \
               --vpc-config "SubnetIds=$SUBNET1,$SUBNET2,SecurityGroupIds=$LAMBDA_SG_ID" \
-              --environment "Variables={DB_HOST=$DB_HOST,DB_NAME=$DB_NAME,DB_USER=$DB_USER,DB_PASS=$DB_MASTER_PASS}" >/dev/null
+              --environment "$ENV_CONS" >/dev/null
           else
             aws lambda create-function --function-name "$CONSUMER_LAMBDA" \
               --runtime python3.12 --handler handler.lambda_handler \
@@ -254,7 +259,7 @@ jobs:
               --zip-file fileb://consumer_code.zip \
               --layers "$LAYER_ARN" \
               --vpc-config "SubnetIds=$SUBNET1,$SUBNET2,SecurityGroupIds=$LAMBDA_SG_ID" \
-              --environment "Variables={DB_HOST=$DB_HOST,DB_NAME=$DB_NAME,DB_USER=$DB_USER,DB_PASS=$DB_MASTER_PASS}" >/dev/null
+              --environment "$ENV_CONS" >/dev/null
           fi
 
           # Event source mapping SQS -> consumer
@@ -267,14 +272,12 @@ jobs:
         id: apigw
         run: |
           set -e
-          # Create/lookup REST API
           API_ID=$(aws apigateway get-rest-apis --query "items[?name=='$API_NAME'].id | [0]" --output text)
           if [ "$API_ID" = "None" ] || [ -z "$API_ID" ]; then
             API_ID=$(aws apigateway create-rest-api --name "$API_NAME" --region "$AWS_REGION" --query 'id' --output text)
           fi
           ROOT_ID=$(aws apigateway get-resources --rest-api-id "$API_ID" --query "items[?path=='/'].id" --output text)
 
-          # /ingest resource + POST method -> Lambda proxy
           RES_ID=$(aws apigateway get-resources --rest-api-id "$API_ID" --query "items[?path=='/ingest'].id" --output text)
           if [ "$RES_ID" = "None" ] || [ -z "$RES_ID" ]; then
             RES_ID=$(aws apigateway create-resource --rest-api-id "$API_ID" --parent-id "$ROOT_ID" --path-part ingest --query 'id' --output text)
@@ -286,12 +289,10 @@ jobs:
           aws apigateway put-integration --rest-api-id "$API_ID" --resource-id "$RES_ID" --http-method POST \
             --type AWS_PROXY --integration-http-method POST --uri "$URI" >/dev/null 2>&1 || true
 
-          # permission for API to call lambda
           aws lambda add-permission --function-name "$INGEST_LAMBDA" --statement-id "apigw-post-ingest" \
             --action lambda:InvokeFunction --principal apigateway.amazonaws.com \
             --source-arn "arn:aws:execute-api:${AWS_REGION}:$(aws sts get-caller-identity --query Account --output text):${API_ID}/*/POST/ingest" >/dev/null 2>&1 || true
 
-          # Deploy
           aws apigateway create-deployment --rest-api-id "$API_ID" --stage-name "$STAGE" >/dev/null
           API_URL="https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/${STAGE}"
           echo "API_URL=$API_URL" >> $GITHUB_ENV
@@ -302,7 +303,6 @@ jobs:
           set -e
           aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || \
             aws ecr create-repository --repository-name "$ECR_REPOSITORY" >/dev/null
-          aws-actions/amazon-ecr-login@v2
 
       - name: Login to ECR
         id: ecr
@@ -331,7 +331,7 @@ jobs:
               while True:
                   payload = {"type": name, "value": gen(), "lat": 49.84, "lon": 24.03}
                   try:
-                      requests.post(API, data=json.dumps(payload), timeout=5)
+                      requests.post(API, json=payload, timeout=5)
                   except Exception:
                       pass
                   time.sleep(max(0.02, period_ms/1000.0))
