@@ -1,8 +1,8 @@
-name: IoT Lab (full, Frankfurt, no extra secrets)
+name: Lab33
 
 on:
   push:
-    branches: ["iot-lab"]
+    branches: ["lab-5"]
 
 env:
   AWS_REGION: eu-central-1
