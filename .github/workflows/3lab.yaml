@@ -50,13 +50,18 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Generate strong DB password (no extra GitHub secret)
-        shell: bash
+        id: genpass
         run: |
-          set -e
-          PASS="$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9%+=_-#' | head -c 24)Aa1!"
-          echo "DB_MASTER_PASS=$PASS" >> $GITHUB_ENV
-          # Не обов'язково, але зручно мати в SSM (можна видалити)
-          aws ssm put-parameter --name "/iotlab/db/master_password" --type "SecureString" --value "$PASS" --overwrite >/dev/null
+          set -euo pipefail
+          DB_PASS=$(python3 - <<'PY'
+          import secrets, string
+          alphabet = string.ascii_letters + string.digits + "-_@%+."
+          print(''.join(secrets.choice(alphabet) for _ in range(24)))
+          PY
+          )
+              echo "::add-mask::$DB_PASS"
+              echo "DB_PASS=$DB_PASS" >> $GITHUB_ENV
+
 
       - name: Resolve VPC + subnets
         id: vpc
