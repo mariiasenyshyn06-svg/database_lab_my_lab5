@@ -3,15 +3,15 @@ name: Lab333
 on:
   push:
     branches: ["lab-5"]
-
+ 
 env:
   AWS_REGION: eu-central-1
 
   # RDS
-  RDS_ID: iotlab-db
+  RDS_ID: iotlab-db1
   DB_NAME: iotlab
   DB_USER: admin
-  DB_MASTER_PASS: LabDemo!12345   
+  DB_MASTER_PASS: root1234
   RDS_SG_NAME: iotlab-rds-sg
   LAMBDA_SG_NAME: iotlab-lambda-sg
 
@@ -52,12 +52,12 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Resolve VPC + subnets
-        id: vpc
         run: |
           set -e
           VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
           SUBNETS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC_ID --query 'Subnets[?MapPublicIpOnLaunch==`true`].SubnetId' --output text)
-          SUBNET1=$(echo $SUBNETS | awk '{print $1}'); SUBNET2=$(echo $SUBNETS | awk '{print $2}')
+          SUBNET1=$(echo $SUBNETS | awk '{print $1}')
+          SUBNET2=$(echo $SUBNETS | awk '{print $2}')
           if [ -z "$SUBNET1" ] || [ -z "$SUBNET2" ]; then echo "Need >=2 public subnets in default VPC"; exit 1; fi
           echo "VPC_ID=$VPC_ID"       >> $GITHUB_ENV
           echo "SUBNET1=$SUBNET1"     >> $GITHUB_ENV
@@ -68,26 +68,30 @@ jobs:
           set -e
           # Lambda SG (egress all)
           LAMBDA_SG_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values="$LAMBDA_SG_NAME" Name=vpc-id,Values="$VPC_ID" --query 'SecurityGroups[0].GroupId' --output text)
-          [ "$LAMBDA_SG_ID" = "None" ] || [ -z "$LAMBDA_SG_ID" ] && \
+          if [ "$LAMBDA_SG_ID" = "None" ] || [ -z "$LAMBDA_SG_ID" ]; then
             LAMBDA_SG_ID=$(aws ec2 create-security-group --group-name "$LAMBDA_SG_NAME" --description "IoT Lab Lambda SG" --vpc-id "$VPC_ID" --query 'GroupId' --output text)
+          fi
           aws ec2 revoke-security-group-egress --group-id "$LAMBDA_SG_ID" --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
           aws ec2 authorize-security-group-egress --group-id "$LAMBDA_SG_ID" --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
 
+          # RDS SG (3306 від Lambda SG + для демо з інтернету)
           RDS_SG_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values="$RDS_SG_NAME" Name=vpc-id,Values="$VPC_ID" --query 'SecurityGroups[0].GroupId' --output text)
-          [ "$RDS_SG_ID" = "None" ] || [ -z "$RDS_SG_ID" ] && \
+          if [ "$RDS_SG_ID" = "None" ] || [ -z "$RDS_SG_ID" ]; then
             RDS_SG_ID=$(aws ec2 create-security-group --group-name "$RDS_SG_NAME" --description "IoT Lab RDS SG" --vpc-id "$VPC_ID" --query 'GroupId' --output text)
+          fi
           aws ec2 authorize-security-group-ingress --group-id "$RDS_SG_ID" --protocol tcp --port 3306 --source-group "$LAMBDA_SG_ID" >/dev/null 2>&1 || true
+          aws ec2 authorize-security-group-ingress --group-id "$RDS_SG_ID" --protocol tcp --port 3306 --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
 
           echo "LAMBDA_SG_ID=$LAMBDA_SG_ID" >> $GITHUB_ENV
           echo "RDS_SG_ID=$RDS_SG_ID"       >> $GITHUB_ENV
 
-      - name: Create/modify RDS MySQL (PUBLIC)
+      - name: Create/modify RDS MySQL (PUBLIC + set password)
         run: |
           set -e
           if ! aws rds describe-db-instances --db-instance-identifier "$RDS_ID" >/dev/null 2>&1; then
             aws rds create-db-instance \
               --db-instance-identifier "$RDS_ID" \
-              --engine mysql --engine-version 8.0.35 \
+              --engine mysql \
               --db-instance-class db.t4g.micro \
               --allocated-storage 20 \
               --master-username "$DB_USER" \
@@ -102,6 +106,7 @@ jobs:
             aws rds modify-db-instance \
               --db-instance-identifier "$RDS_ID" \
               --publicly-accessible \
+              --master-user-password "$DB_MASTER_PASS" \
               --apply-immediately
           fi
           aws rds wait db-instance-available --db-instance-identifier "$RDS_ID"
@@ -109,17 +114,7 @@ jobs:
           echo "DB_HOST=$DB_HOST" >> $GITHUB_ENV
           echo "RDS endpoint: $DB_HOST"
 
-      - name: Allow my current IP to RDS:3306
-        run: |
-          set -e
-          MYIP=$(curl -s https://checkip.amazonaws.com | tr -d '\n\r')
-          echo "My IP: $MYIP"
-          aws ec2 authorize-security-group-ingress \
-            --group-id "$RDS_SG_ID" --protocol tcp --port 3306 --cidr "$MYIP/32" >/dev/null 2>&1 || true
-
-
       - name: Create SQS queue
-        id: sqs
         run: |
           set -e
           aws sqs create-queue --queue-name "$SQS_NAME" >/dev/null 2>&1 || true
@@ -138,14 +133,17 @@ jobs:
           aws iam attach-role-policy --role-name "$LAMBDA_ROLE" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole >/dev/null 2>&1 || true
           aws iam attach-role-policy --role-name "$LAMBDA_ROLE" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole >/dev/null 2>&1 || true
           aws iam attach-role-policy --role-name "$LAMBDA_ROLE" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole >/dev/null 2>&1 || true
+
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          cat > sqs-send.json <<EOF
-          {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:SendMessage"],"Resource":"$QUEUE_ARN"}]}
+          cat > sqs-send.json <<'EOF'
+          {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:SendMessage"],"Resource":"__QUEUE_ARN__"}]}
           EOF
+          sed -i "s|__QUEUE_ARN__|$QUEUE_ARN|g" sqs-send.json
           if ! aws iam get-policy --policy-arn arn:aws:iam::$ACCOUNT_ID:policy/iotlab-sqs-send >/dev/null 2>&1; then
             aws iam create-policy --policy-name iotlab-sqs-send --policy-document file://sqs-send.json >/dev/null
           fi
           aws iam attach-role-policy --role-name "$LAMBDA_ROLE" --policy-arn arn:aws:iam::$ACCOUNT_ID:policy/iotlab-sqs-send >/dev/null 2>&1 || true
+
           ROLE_ARN=$(aws iam get-role --role-name "$LAMBDA_ROLE" --query 'Role.Arn' --output text)
           echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
 
@@ -161,9 +159,9 @@ jobs:
               sleep 3
             done
           }
+
           mkdir -p lambda_ingest lambda_consumer
 
-          # ingest (API -> SQS)
           cat > lambda_ingest/handler.py <<'PY'
           import os, json, boto3, time
           sqs = boto3.client('sqs')
@@ -178,7 +176,6 @@ jobs:
               return {"statusCode": 202, "headers":{"Content-Type":"application/json"}, "body": json.dumps({"ok": True})}
           PY
 
-          # consumer (SQS -> MySQL)
           cat > lambda_consumer/handler.py <<'PY'
           import os, json, pymysql, time
           DB_HOST = os.environ['DB_HOST']
@@ -265,7 +262,6 @@ jobs:
           fi
 
       - name: API Gateway for ingest Lambda
-        id: apigw
         run: |
           set -e
           API_ID=$(aws apigateway get-rest-apis --query "items[?name=='$API_NAME'].id | [0]" --output text)
@@ -273,18 +269,23 @@ jobs:
             API_ID=$(aws apigateway create-rest-api --name "$API_NAME" --region "$AWS_REGION" --query 'id' --output text)
           fi
           ROOT_ID=$(aws apigateway get-resources --rest-api-id "$API_ID" --query "items[?path=='/'].id" --output text)
+
           RES_ID=$(aws apigateway get-resources --rest-api-id "$API_ID" --query "items[?path=='/ingest'].id" --output text)
           if [ "$RES_ID" = "None" ] || [ -z "$RES_ID" ]; then
             RES_ID=$(aws apigateway create-resource --rest-api-id "$API_ID" --parent-id "$ROOT_ID" --path-part ingest --query 'id' --output text)
           fi
+
           aws apigateway put-method --rest-api-id "$API_ID" --resource-id "$RES_ID" --http-method POST --authorization-type "NONE" >/dev/null 2>&1 || true
+
           LAMBDA_ARN=$(aws lambda get-function --function-name "$INGEST_LAMBDA" --query 'Configuration.FunctionArn' --output text)
           URI="arn:aws:apigateway:${AWS_REGION}:lambda:path/2015-03-31/functions/${LAMBDA_ARN}/invocations"
           aws apigateway put-integration --rest-api-id "$API_ID" --resource-id "$RES_ID" --http-method POST \
             --type AWS_PROXY --integration-http-method POST --uri "$URI" >/dev/null 2>&1 || true
+
           aws lambda add-permission --function-name "$INGEST_LAMBDA" --statement-id "apigw-post-ingest" \
             --action lambda:InvokeFunction --principal apigateway.amazonaws.com \
             --source-arn "arn:aws:execute-api:${AWS_REGION}:$(aws sts get-caller-identity --query Account --output text):${API_ID}/*/POST/ingest" >/dev/null 2>&1 || true
+
           aws apigateway create-deployment --rest-api-id "$API_ID" --stage-name "$STAGE" >/dev/null
           API_URL="https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/${STAGE}"
           echo "API_URL=$API_URL" >> $GITHUB_ENV
@@ -293,8 +294,7 @@ jobs:
       - name: Ensure ECR repo
         run: |
           set -e
-          aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || \
-            aws ecr create-repository --repository-name "$ECR_REPOSITORY" >/dev/null
+          aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || aws ecr create-repository --repository-name "$ECR_REPOSITORY" >/dev/null
 
       - name: Login to ECR
         id: ecr
@@ -344,7 +344,16 @@ jobs:
           set -e
           aws ecs create-cluster --cluster-name "$CLUSTER_NAME" >/dev/null 2>&1 || true
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          cat > taskdef.json <<JSON
+
+          # ensure task exec role
+          if ! aws iam get-role --role-name ecsTaskExecutionRole >/dev/null 2>&1; then
+            printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}' > trust.json
+            aws iam create-role --role-name ecsTaskExecutionRole --assume-role-policy-document file://trust.json >/dev/null
+            aws iam attach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy >/dev/null
+          fi
+
+          # task definition (важливо: маркер EOF і вгорі, і внизу — один і той самий, без пробілів)
+          cat > taskdef.json <<EOF
           {
             "family": "${EMU_TASK_FAMILY}",
             "networkMode": "awsvpc",
@@ -352,7 +361,7 @@ jobs:
             "cpu": "${EMU_CPU}",
             "memory": "${EMU_MEM}",
             "executionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole",
-            "taskRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole",
+            "taskRoleArn":      "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole",
             "containerDefinitions": [{
               "name": "${EMU_CONTAINER}",
               "image": "${EMU_IMAGE}",
@@ -365,26 +374,48 @@ jobs:
               ]
             }]
           }
-          JSON
-          if ! aws iam get-role --role-name ecsTaskExecutionRole >/dev/null 2>&1; then
-            printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}' > trust.json
-            aws iam create-role --role-name ecsTaskExecutionRole --assume-role-policy-document file://trust.json >/dev/null
-            aws iam attach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy >/dev/null
-          fi
+          EOF
+
           aws ecs register-task-definition --cli-input-json file://taskdef.json >/dev/null
+
           aws ecs run-task \
             --launch-type FARGATE \
             --cluster "$CLUSTER_NAME" \
             --task-definition "$EMU_TASK_FAMILY" \
             --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}" >/dev/null
+
           echo "Emulator started → ${API_URL}/ingest"
+
+
+      - name: Smoke test (send 3 events + check DB)
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y mysql-client curl jq
+          for p in \
+            '{"type":"temperature","value":24.7,"lat":49.84,"lon":24.03}' \
+            '{"type":"humidity","value":55.2,"lat":49.84,"lon":24.03}' \
+            '{"type":"light","value":350,"lat":49.84,"lon":24.03}'; do
+            curl -s -X POST "$API_URL/ingest" -H 'Content-Type: application/json' -d "$p" >/dev/null || true
+          done
+          echo "Waiting for consumer writes..."
+          sleep 25
+          mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_MASTER_PASS" "$DB_NAME" -e "SELECT COUNT(*) AS cnt FROM sensor_data; SELECT * FROM sensor_data ORDER BY id DESC LIMIT 5;"
 
       - name: Print MySQL connect command (easy copy-paste)
         run: |
-          echo ""
+          echo
           echo "Use this from your laptop:"
           echo "mysql -h ${DB_HOST} -u ${DB_USER} -p'${DB_MASTER_PASS}' ${DB_NAME}"
-          {
-            echo "### MySQL connect command"
-            echo "\`mysql -h ${DB_HOST} -u ${DB_USER} -p'${DB_MASTER_PASS}' ${DB_NAME}\`"
-          } >> $GITHUB_STEP_SUMMARY
+          cat >> "$GITHUB_STEP_SUMMARY" <<MD
+          ### MySQL connect
+          \`\`\`bash
+          mysql -h ${DB_HOST} -u ${DB_USER} -p'${DB_MASTER_PASS}' ${DB_NAME}
+          \`\`\`
+
+          ### Quick query
+          \`\`\`sql
+          SELECT COUNT(*) AS cnt FROM sensor_data;
+          SELECT * FROM sensor_data ORDER BY id DESC LIMIT 10;
+          \`\`\`
+          MD
