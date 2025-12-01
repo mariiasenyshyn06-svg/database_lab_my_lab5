@@ -1,4 +1,4 @@
-name: Lab33 
+name: Lab333
 
 on:
   push:
@@ -62,7 +62,6 @@ jobs:
           )
           echo "::add-mask::$DB_MASTER_PASS"
           echo "DB_MASTER_PASS=$DB_MASTER_PASS" >> $GITHUB_ENV
-
       - name: Resolve VPC + subnets
         id: vpc
         run: |
@@ -74,7 +73,6 @@ jobs:
           echo "VPC_ID=$VPC_ID"       >> $GITHUB_ENV
           echo "SUBNET1=$SUBNET1"     >> $GITHUB_ENV
           echo "SUBNET2=$SUBNET2"     >> $GITHUB_ENV
-
       - name: Security groups (RDS + Lambda)
         run: |
           set -e
@@ -84,30 +82,27 @@ jobs:
             LAMBDA_SG_ID=$(aws ec2 create-security-group --group-name "$LAMBDA_SG_NAME" --description "IoT Lab Lambda SG" --vpc-id "$VPC_ID" --query 'GroupId' --output text)
           aws ec2 revoke-security-group-egress --group-id "$LAMBDA_SG_ID" --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
           aws ec2 authorize-security-group-egress --group-id "$LAMBDA_SG_ID" --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
-
           # RDS SG (ingress 3306 only from Lambda SG)
           RDS_SG_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values="$RDS_SG_NAME" Name=vpc-id,Values="$VPC_ID" --query 'SecurityGroups[0].GroupId' --output text)
           [ "$RDS_SG_ID" = "None" ] || [ -z "$RDS_SG_ID" ] && \
             RDS_SG_ID=$(aws ec2 create-security-group --group-name "$RDS_SG_NAME" --description "IoT Lab RDS SG" --vpc-id "$VPC_ID" --query 'GroupId' --output text)
           aws ec2 authorize-security-group-ingress --group-id "$RDS_SG_ID" --protocol tcp --port 3306 --source-group "$LAMBDA_SG_ID" >/dev/null 2>&1 || true
-
           echo "LAMBDA_SG_ID=$LAMBDA_SG_ID" >> $GITHUB_ENV
           echo "RDS_SG_ID=$RDS_SG_ID"       >> $GITHUB_ENV
-
       - name: Create RDS MySQL (private)
         run: |
           set -e
           if ! aws rds describe-db-instances --db-instance-identifier "$RDS_ID" >/dev/null 2>&1; then
             aws rds create-db-instance \
               --db-instance-identifier "$RDS_ID" \
-              --engine mysql --engine-version 8.0.35 \
+              --engine mysql \
               --db-instance-class db.t4g.micro \
               --allocated-storage 20 \
               --master-username "$DB_USER" \
               --master-user-password "$DB_MASTER_PASS" \
               --vpc-security-group-ids "$RDS_SG_ID" \
               --db-name "$DB_NAME" \
-              --no-multi-az --publicly-accessible false \
+              --no-multi-az --no-publicly-accessible \
               --backup-retention-period 0 \
               --storage-type gp2
           fi
@@ -115,7 +110,6 @@ jobs:
           DB_HOST=$(aws rds describe-db-instances --db-instance-identifier "$RDS_ID" --query 'DBInstances[0].Endpoint.Address' --output text)
           echo "DB_HOST=$DB_HOST" >> $GITHUB_ENV
           echo "RDS endpoint: $DB_HOST"
-
       - name: Create SQS queue
         id: sqs
         run: |
@@ -126,7 +120,6 @@ jobs:
           echo "QUEUE_URL=$QUEUE_URL" >> $GITHUB_ENV
           echo "QUEUE_ARN=$QUEUE_ARN" >> $GITHUB_ENV
           echo "Queue: $QUEUE_URL"
-
       - name: IAM role for Lambdas
         run: |
           set -e
@@ -137,7 +130,6 @@ jobs:
           aws iam attach-role-policy --role-name "$LAMBDA_ROLE" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole >/dev/null 2>&1 || true
           aws iam attach-role-policy --role-name "$LAMBDA_ROLE" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole >/dev/null 2>&1 || true
           aws iam attach-role-policy --role-name "$LAMBDA_ROLE" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole >/dev/null 2>&1 || true
-
           # Дозвіл інжест-ламбді відправляти в SQS (custom policy)
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           cat > sqs-send.json <<EOF
@@ -149,11 +141,9 @@ jobs:
           aws iam attach-role-policy --role-name "$LAMBDA_ROLE" --policy-arn arn:aws:iam::$ACCOUNT_ID:policy/iotlab-sqs-send >/dev/null 2>&1 || true
           ROLE_ARN=$(aws iam get-role --role-name "$LAMBDA_ROLE" --query 'Role.Arn' --output text)
           echo "ROLE_ARN=$ROLE_ARN" >> $GITHUB_ENV
-
       - name: Build & deploy Lambdas (ingest -> SQS, consumer SQS -> MySQL)
         run: |
           set -e
-
           wait_lambda_ok () {
             FN="$1"
             for i in $(seq 1 60); do
@@ -167,9 +157,7 @@ jobs:
               sleep 3
             done
           }
-
           mkdir -p lambda_ingest lambda_consumer
-
           # -------- ingest (API -> SQS)
           cat > lambda_ingest/handler.py <<'PY'
           import os, json, boto3, time
@@ -184,7 +172,6 @@ jobs:
               sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(body))
               return {"statusCode": 202, "headers":{"Content-Type":"application/json"}, "body": json.dumps({"ok": True})}
           PY
-
           # -------- consumer (SQS -> MySQL)
           cat > lambda_consumer/handler.py <<'PY'
           import os, json, pymysql, time
@@ -226,17 +213,14 @@ jobs:
                   con.close()
               return {"ok": True}
           PY
-
           # Vendoring deps for consumer
           python -m pip install --upgrade pip >/dev/null
           pip install -q -t lambda_consumer/python pymysql
           (cd lambda_ingest && zip -rq ../ingest.zip .)
           (cd lambda_consumer && zip -rq ../consumer_layer.zip python)
           (cd lambda_consumer && zip -rq ../consumer_code.zip handler.py)
-
           # Create/Update consumer layer
           LAYER_ARN=$(aws lambda publish-layer-version --layer-name iotlab-pymysql --zip-file fileb://consumer_layer.zip --compatible-runtimes python3.12 --query 'LayerVersionArn' --output text)
-
           # Create/Update ingest function
           if aws lambda get-function --function-name "$INGEST_LAMBDA" >/dev/null 2>&1; then
             aws lambda update-function-code --function-name "$INGEST_LAMBDA" --zip-file fileb://ingest.zip >/dev/null
@@ -249,7 +233,6 @@ jobs:
               --environment "Variables={QUEUE_URL=$QUEUE_URL}" >/dev/null
             wait_lambda_ok "$INGEST_LAMBDA"
           fi
-
           # Create/Update consumer function (in VPC)
           if aws lambda get-function --function-name "$CONSUMER_LAMBDA" >/dev/null 2>&1; then
             aws lambda update-function-code --function-name "$CONSUMER_LAMBDA" --zip-file fileb://consumer_code.zip >/dev/null
@@ -269,13 +252,11 @@ jobs:
               --environment "Variables={DB_HOST=$DB_HOST,DB_NAME=$DB_NAME,DB_USER=$DB_USER,DB_PASS=$DB_MASTER_PASS}" >/dev/null
             wait_lambda_ok "$CONSUMER_LAMBDA"
           fi
-
           # Event source mapping SQS -> consumer
           MAPPING_ID=$(aws lambda list-event-source-mappings --function-name "$CONSUMER_LAMBDA" --query "EventSourceMappings[?EventSourceArn=='$QUEUE_ARN'].UUID | [0]" --output text)
           if [ -z "$MAPPING_ID" ] || [ "$MAPPING_ID" = "None" ]; then
             aws lambda create-event-source-mapping --function-name "$CONSUMER_LAMBDA" --event-source-arn "$QUEUE_ARN" --batch-size 10 >/dev/null
           fi
-
       - name: API Gateway for ingest Lambda
         id: apigw
         run: |
@@ -286,36 +267,30 @@ jobs:
             API_ID=$(aws apigateway create-rest-api --name "$API_NAME" --region "$AWS_REGION" --query 'id' --output text)
           fi
           ROOT_ID=$(aws apigateway get-resources --rest-api-id "$API_ID" --query "items[?path=='/'].id" --output text)
-
           # /ingest resource + POST method -> Lambda proxy
           RES_ID=$(aws apigateway get-resources --rest-api-id "$API_ID" --query "items[?path=='/ingest'].id" --output text)
           if [ "$RES_ID" = "None" ] || [ -z "$RES_ID" ]; then
             RES_ID=$(aws apigateway create-resource --rest-api-id "$API_ID" --parent-id "$ROOT_ID" --path-part ingest --query 'id' --output text)
           fi
           aws apigateway put-method --rest-api-id "$API_ID" --resource-id "$RES_ID" --http-method POST --authorization-type "NONE" >/dev/null 2>&1 || true
-
           LAMBDA_ARN=$(aws lambda get-function --function-name "$INGEST_LAMBDA" --query 'Configuration.FunctionArn' --output text)
           URI="arn:aws:apigateway:${AWS_REGION}:lambda:path/2015-03-31/functions/${LAMBDA_ARN}/invocations"
           aws apigateway put-integration --rest-api-id "$API_ID" --resource-id "$RES_ID" --http-method POST \
             --type AWS_PROXY --integration-http-method POST --uri "$URI" >/dev/null 2>&1 || true
-
           # permission for API to call lambda
           aws lambda add-permission --function-name "$INGEST_LAMBDA" --statement-id "apigw-post-ingest" \
             --action lambda:InvokeFunction --principal apigateway.amazonaws.com \
             --source-arn "arn:aws:execute-api:${AWS_REGION}:$(aws sts get-caller-identity --query Account --output text):${API_ID}/*/POST/ingest" >/dev/null 2>&1 || true
-
           # Deploy
           aws apigateway create-deployment --rest-api-id "$API_ID" --stage-name "$STAGE" >/dev/null
           API_URL="https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/${STAGE}"
           echo "API_URL=$API_URL" >> $GITHUB_ENV
           echo "API URL: $API_URL/ingest"
-
       - name: Ensure ECR repo
         run: |
           set -e
           aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || \
             aws ecr create-repository --repository-name "$ECR_REPOSITORY" >/dev/null
-
       - name: Login to ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -358,7 +333,6 @@ jobs:
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest emu
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "EMU_IMAGE=$ECR_REGISTRY/$ECR_REPOSITORY:latest" >> $GITHUB_ENV
-
       - name: Run emulator once on Fargate
         run: |
           set -e
