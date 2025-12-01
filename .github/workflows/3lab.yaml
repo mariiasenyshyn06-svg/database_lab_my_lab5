@@ -8,7 +8,7 @@ env:
   AWS_REGION: eu-central-1
 
   # RDS
-  RDS_ID: iotlab-db1
+  RDS_ID: iotlab-db2
   DB_NAME: iotlab
   DB_USER: admin
   DB_MASTER_PASS: root1234
