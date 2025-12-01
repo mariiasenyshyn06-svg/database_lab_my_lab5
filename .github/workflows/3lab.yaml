@@ -11,7 +11,7 @@ env:
   RDS_ID: iotlab-db
   DB_NAME: iotlab
   DB_USER: admin
-  DB_MASTER_PASS: LabDemo!12345
+  DB_MASTER_PASS: LabDemo!12345   
   RDS_SG_NAME: iotlab-rds-sg
   LAMBDA_SG_NAME: iotlab-lambda-sg
 
@@ -73,7 +73,6 @@ jobs:
           aws ec2 revoke-security-group-egress --group-id "$LAMBDA_SG_ID" --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
           aws ec2 authorize-security-group-egress --group-id "$LAMBDA_SG_ID" --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' >/dev/null 2>&1 || true
 
-          # RDS SG (ingress 3306 тільки від Lambda SG)
           RDS_SG_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values="$RDS_SG_NAME" Name=vpc-id,Values="$VPC_ID" --query 'SecurityGroups[0].GroupId' --output text)
           [ "$RDS_SG_ID" = "None" ] || [ -z "$RDS_SG_ID" ] && \
             RDS_SG_ID=$(aws ec2 create-security-group --group-name "$RDS_SG_NAME" --description "IoT Lab RDS SG" --vpc-id "$VPC_ID" --query 'GroupId' --output text)
@@ -82,27 +81,42 @@ jobs:
           echo "LAMBDA_SG_ID=$LAMBDA_SG_ID" >> $GITHUB_ENV
           echo "RDS_SG_ID=$RDS_SG_ID"       >> $GITHUB_ENV
 
-      - name: Create RDS MySQL (private)
+      - name: Create/modify RDS MySQL (PUBLIC)
         run: |
           set -e
           if ! aws rds describe-db-instances --db-instance-identifier "$RDS_ID" >/dev/null 2>&1; then
             aws rds create-db-instance \
               --db-instance-identifier "$RDS_ID" \
-              --engine mysql \
+              --engine mysql --engine-version 8.0.35 \
               --db-instance-class db.t4g.micro \
               --allocated-storage 20 \
               --master-username "$DB_USER" \
               --master-user-password "$DB_MASTER_PASS" \
               --vpc-security-group-ids "$RDS_SG_ID" \
               --db-name "$DB_NAME" \
-              --no-multi-az --no-publicly-accessible \
+              --publicly-accessible \
+              --no-multi-az \
               --backup-retention-period 0 \
               --storage-type gp2
+          else
+            aws rds modify-db-instance \
+              --db-instance-identifier "$RDS_ID" \
+              --publicly-accessible \
+              --apply-immediately
           fi
           aws rds wait db-instance-available --db-instance-identifier "$RDS_ID"
           DB_HOST=$(aws rds describe-db-instances --db-instance-identifier "$RDS_ID" --query 'DBInstances[0].Endpoint.Address' --output text)
           echo "DB_HOST=$DB_HOST" >> $GITHUB_ENV
           echo "RDS endpoint: $DB_HOST"
+
+      - name: Allow my current IP to RDS:3306
+        run: |
+          set -e
+          MYIP=$(curl -s https://checkip.amazonaws.com | tr -d '\n\r')
+          echo "My IP: $MYIP"
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$RDS_SG_ID" --protocol tcp --port 3306 --cidr "$MYIP/32" >/dev/null 2>&1 || true
+
 
       - name: Create SQS queue
         id: sqs
@@ -113,7 +127,6 @@ jobs:
           QUEUE_ARN=$(aws sqs get-queue-attributes --queue-url "$QUEUE_URL" --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
           echo "QUEUE_URL=$QUEUE_URL" >> $GITHUB_ENV
           echo "QUEUE_ARN=$QUEUE_ARN" >> $GITHUB_ENV
-          echo "Queue: $QUEUE_URL"
 
       - name: IAM role for Lambdas
         run: |
@@ -366,23 +379,12 @@ jobs:
             --network-configuration "awsvpcConfiguration={subnets=[$SUBNET1,$SUBNET2],assignPublicIp=ENABLED}" >/dev/null
           echo "Emulator started → ${API_URL}/ingest"
 
-      - name: Print DB creds & ready SQL
+      - name: Print MySQL connect command (easy copy-paste)
         run: |
-          echo "================ DB CREDS (TEST) ================"
-          echo "HOST: $DB_HOST"
-          echo "USER: $DB_USER"
-          echo "PASS: $DB_MASTER_PASS"
-          echo "DB  : $DB_NAME"
-          echo "mysql -h $DB_HOST -u $DB_USER -p'$DB_MASTER_PASS' $DB_NAME -e \"SELECT COUNT(*) AS cnt FROM sensor_data; SELECT * FROM sensor_data ORDER BY id DESC LIMIT 10;\""
+          echo ""
+          echo "Use this from your laptop:"
+          echo "mysql -h ${DB_HOST} -u ${DB_USER} -p'${DB_MASTER_PASS}' ${DB_NAME}"
           {
-            echo "## DB creds (test)"
-            echo "- **Host**: \`$DB_HOST\`"
-            echo "- **User**: \`$DB_USER\`"
-            echo "- **Pass**: \`$DB_MASTER_PASS\`"
-            echo "- **DB**  : \`$DB_NAME\`"
-            echo ""
-            echo "### Ready command"
-            echo "\`mysql -h $DB_HOST -u $DB_USER -p'$DB_MASTER_PASS' $DB_NAME -e \"SELECT COUNT(*) AS cnt FROM sensor_data; SELECT * FROM sensor_data ORDER BY id DESC LIMIT 10;\" \`"
-            echo ""
-            echo "_Нагадування: інстанс **приватний**. Запускати команду треба з EC2 у цій же VPC або через **RDS → Query Editor v2**._"
+            echo "### MySQL connect command"
+            echo "\`mysql -h ${DB_HOST} -u ${DB_USER} -p'${DB_MASTER_PASS}' ${DB_NAME}\`"
           } >> $GITHUB_STEP_SUMMARY
